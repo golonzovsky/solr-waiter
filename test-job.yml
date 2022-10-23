@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: solr-waiter-test
+spec:
+  template:
+    spec:
+      containers:
+        - name: solr-waiter
+          image: golonzovsky/solr-waiter:0.1
+          args: ["solr-test", "-n", "sandbox"]
+      restartPolicy: Never
+      serviceAccountName: solr-waiter
+  backoffLimit: 4
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: solr-waiter
+rules:
+  - apiGroups: ["solr.apache.org"]
+    resources: ["solrclouds"]
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: solr-waiter
+  namespace: sandbox
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: solr-waiter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: solr-waiter
+subjects:
+  - name: solr-waiter
+    namespace: sandbox
+    kind: ServiceAccount
