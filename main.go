@@ -69,13 +69,15 @@ func NewRootCmd() *cobra.Command {
 		Short:             "solr-waiter waits for solrcloud to be ready",
 		Args:              cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
 		ValidArgsFunction: cobra.NoFileCompletions,
-		Run: func(cmd *cobra.Command, args []string) {
+		SilenceErrors:     true,
+		RunE: func(cmd *cobra.Command, args []string) error {
 			clusterName := args[0]
-			doStuff(cmd.Context(), clusterName, *conf)
+			cmd.SilenceUsage = true
+			return doStuff(cmd.Context(), clusterName, *conf)
 		},
 	}
-	cmd.Flags().DurationVar(&conf.timeoutInterval, "timeout-interval", 10*time.Minute, "timeout interval. Set 0 to disable timeout. Default 10m")
-	cmd.Flags().DurationVar(&conf.initialDelay, "initial-delay", 0*time.Second, "initial delay. Default 0s")
+	cmd.Flags().DurationVar(&conf.timeoutInterval, "timeout", 10*time.Minute, "timeout interval. Set 0 to disable timeout")
+	cmd.Flags().DurationVar(&conf.initialDelay, "initial-delay", 0*time.Second, "initial delay. Default 0 - no delay")
 	cmd.Flags().StringVarP(&conf.namespace, "namespace", "n", "", "namespace of the cluster")
 	cmd.MarkFlagRequired("namespace")
 	return cmd
@@ -88,8 +90,7 @@ func doStuff(ctx context.Context, clusterName string, conf config) error {
 		defer cancel()
 		select {
 		case <-ctx.Done():
-			fmt.Fprintf(os.Stderr, "Received interrupt.\n")
-			os.Exit(1)
+			return fmt.Errorf("initial wait interrupted")
 		case <-waitCtx.Done():
 		}
 		fmt.Printf("starting watcher for %s\n", clusterName)
@@ -102,15 +103,13 @@ func doStuff(ctx context.Context, clusterName string, conf config) error {
 	// construct k8s dynamic client
 	client, err := constructClient()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "unable to build k8s client: %s", err.Error())
-		os.Exit(1)
+		return fmt.Errorf("unable to build k8s client: %s", err.Error())
 	}
 
 	// validate cluster exists
 	_, err = client.Resource(solrResource).Namespace(conf.namespace).Get(ctx, clusterName, v1.GetOptions{})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to fetch cluster %s/%s: %s\n", conf.namespace, clusterName, err.Error())
-		os.Exit(1)
+		return fmt.Errorf("failed to fetch cluster %s/%s: %s\n", conf.namespace, clusterName, err.Error())
 	}
 
 	// construct watcher
@@ -138,8 +137,7 @@ func doStuff(ctx context.Context, clusterName string, conf config) error {
 		case cluster := <-informerReceiveObjectCh:
 			status, err := getClusterStatus(cluster)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to fetch status of %s/%s: %s\n", conf.namespace, clusterName, err.Error())
-				os.Exit(1)
+				return fmt.Errorf("failed to fetch status of %s/%s: %s\n", conf.namespace, clusterName, err.Error())
 			}
 			if status.ready == status.total {
 				printStatusMsg("cluster "+clusterName+" is ready. Exiting.", startTime)
@@ -147,8 +145,7 @@ func doStuff(ctx context.Context, clusterName string, conf config) error {
 			}
 			printStatusMsg(fmt.Sprintf("ready %d out of %d", status.ready, status.total), startTime)
 		case <-ctx.Done():
-			fmt.Fprintf(os.Stderr, "cluster %s is not ready. Exiting with timeout/interrupt.\n", clusterName)
-			os.Exit(1)
+			return fmt.Errorf("cluster %s is not ready. Exiting with timeout/interrupt", clusterName)
 		}
 	}
 
