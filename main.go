@@ -80,6 +80,13 @@ func doStuff(clusterName string, conf config) error {
 		os.Exit(1)
 	}
 
+	// validate cluster exists
+	_, err = client.Resource(solrResource).Namespace(conf.namespace).Get(ctx, clusterName, v1.GetOptions{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to fetch cluster %s/%s: %s\n", conf.namespace, clusterName, err.Error())
+		os.Exit(1)
+	}
+
 	// construct watcher
 	informerReceiveObjectCh := make(chan *unstructured.Unstructured, 1)
 	tweakListOpts := func(options *v1.ListOptions) {
@@ -142,6 +149,7 @@ func calculateElapsed(startTime time.Time) time.Duration {
 
 func resendEventToCh(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandlerFuncs {
 	return &cache.ResourceEventHandlerFuncs{
+		// this is for "already ready" case
 		AddFunc: func(obj interface{}) {
 			rcvCh <- obj.(*unstructured.Unstructured)
 		},

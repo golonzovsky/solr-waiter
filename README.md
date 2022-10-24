@@ -8,10 +8,10 @@ If there is an easier way to do this (e.g. with some `kubectl wait --for=conditi
 
 ### Example usage
 ```sh
-solr-waiter solr-test -n sandbox
-ready 2 out of 3, retry in 3s, timeout in ~9m59s
-ready 2 out of 3, retry in 3s, timeout in ~9m56s
-cluster solr-test is ready. Exiting.
+solr-waiter solr-test -n sandbox                                                                                        gke_personal/sandbox
+elapsed 0s, ready 2 out of 3
+elapsed 3s, still watching cluster (timeout in ~9m57s)
+elapsed 4s, cluster solr-test is ready. Exiting.
 ```
 
 ### Example usage in cluster
