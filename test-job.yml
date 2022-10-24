@@ -7,11 +7,11 @@ spec:
     spec:
       containers:
         - name: solr-waiter
-          image: golonzovsky/solr-waiter:0.1
+          image: golonzovsky/solr-waiter:0.2.1
           args: ["solr-test", "-n", "sandbox"]
       restartPolicy: Never
       serviceAccountName: solr-waiter
-  backoffLimit: 4
+  backoffLimit: 3
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
