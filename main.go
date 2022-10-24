@@ -38,7 +38,25 @@ type config struct {
 }
 
 func main() {
-	if err := NewRootCmd().Execute(); err != nil {
+	// interrupt handling
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	defer func() { signal.Stop(c) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-c: // first signal, cancel context
+			cancel()
+		case <-ctx.Done():
+		}
+		<-c // second signal, hard exit
+		fmt.Fprintln(os.Stderr, "second interrupt, exiting")
+		os.Exit(1)
+	}()
+
+	if err := NewRootCmd().ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -53,7 +71,7 @@ func NewRootCmd() *cobra.Command {
 		ValidArgsFunction: cobra.NoFileCompletions,
 		Run: func(cmd *cobra.Command, args []string) {
 			clusterName := args[0]
-			doStuff(clusterName, *conf)
+			doStuff(cmd.Context(), clusterName, *conf)
 		},
 	}
 	cmd.Flags().DurationVar(&conf.timeoutInterval, "timeout-interval", 10*time.Minute, "timeout interval. Set 0 to disable timeout. Default 10m")
@@ -63,15 +81,23 @@ func NewRootCmd() *cobra.Command {
 	return cmd
 }
 
-func doStuff(clusterName string, conf config) error {
-	// construct context with timeout
-	ctx, cancel := watch.ContextWithOptionalTimeout(context.Background(), conf.timeoutInterval)
-	defer cancel()
+func doStuff(ctx context.Context, clusterName string, conf config) error {
+	if conf.initialDelay > 0 {
+		fmt.Printf("waiting for %s before watch start\n", conf.initialDelay)
+		waitCtx, cancel := watch.ContextWithOptionalTimeout(context.Background(), conf.initialDelay)
+		defer cancel()
+		select {
+		case <-ctx.Done():
+			fmt.Fprintf(os.Stderr, "Received interrupt.\n")
+			os.Exit(1)
+		case <-waitCtx.Done():
+		}
+		fmt.Printf("starting watcher for %s\n", clusterName)
+	}
 
-	// interrupt handling
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	defer func() { signal.Stop(c) }()
+	// construct context with timeout
+	ctx, cancel := watch.ContextWithOptionalTimeout(ctx, conf.timeoutInterval)
+	defer cancel()
 
 	// construct k8s dynamic client
 	client, err := constructClient()
@@ -108,7 +134,7 @@ func doStuff(clusterName string, conf config) error {
 	for {
 		select {
 		case <-ticker.C:
-			printStatus(startTime, conf.timeoutInterval)
+			printStatus(startTime, conf)
 		case cluster := <-informerReceiveObjectCh:
 			status, err := getClusterStatus(cluster)
 			if err != nil {
@@ -120,19 +146,16 @@ func doStuff(clusterName string, conf config) error {
 				return nil
 			}
 			printStatusMsg(fmt.Sprintf("ready %d out of %d", status.ready, status.total), startTime)
-		case <-c:
-			cancel()
-			return nil
 		case <-ctx.Done():
-			fmt.Fprintf(os.Stderr, "cluster %s is not ready. Exiting with timeout.\n", clusterName)
+			fmt.Fprintf(os.Stderr, "cluster %s is not ready. Exiting with timeout/interrupt.\n", clusterName)
 			os.Exit(1)
 		}
 	}
 
 }
 
-func printStatus(startTime time.Time, timeout time.Duration) {
-	timeoutIn := timeout - calculateElapsed(startTime)
+func printStatus(startTime time.Time, conf config) {
+	timeoutIn := conf.timeoutInterval - calculateElapsed(startTime)
 	if timeoutIn < 0 {
 		printStatusMsg("still watching cluster", startTime)
 	}
