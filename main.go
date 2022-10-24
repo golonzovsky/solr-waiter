@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 )
@@ -27,27 +28,10 @@ type solrStatus struct {
 	total int64
 }
 
-func NewRootCmd() *cobra.Command {
-	var (
-		retryInterval   = 3 * time.Second
-		timeoutInterval = 10 * time.Minute
-		namespace       = ""
-	)
-	cmd := &cobra.Command{
-		Use:               "solr-waiter [cluster name] -n namespace",
-		Short:             "solr-waiter waits for solrcloud to be ready",
-		Args:              cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
-		ValidArgsFunction: cobra.NoFileCompletions,
-		Run: func(cmd *cobra.Command, args []string) {
-			clusterName := args[0]
-			doStuff(clusterName, namespace, timeoutInterval, retryInterval)
-		},
-	}
-	cmd.Flags().DurationVar(&retryInterval, "retry-interval", retryInterval, "retry interval. Default 3s")
-	cmd.Flags().DurationVar(&timeoutInterval, "timeout-interval", timeoutInterval, "timeout interval. Default 10m")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", namespace, "namespace of the cluster")
-	cmd.MarkFlagRequired("namespace")
-	return cmd
+type config struct {
+	retryInterval   time.Duration
+	timeoutInterval time.Duration
+	namespace       string
 }
 
 func main() {
@@ -57,15 +41,34 @@ func main() {
 	}
 }
 
-func doStuff(clusterName, namespace string, timeout, retry time.Duration) error {
-	// construct context with interrupt handling
-	ctx, cancel := context.WithCancel(context.Background())
+func NewRootCmd() *cobra.Command {
+	conf := &config{}
+	cmd := &cobra.Command{
+		Use:               "solr-waiter [cluster name] -n namespace",
+		Short:             "solr-waiter waits for solrcloud to be ready",
+		Args:              cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
+		ValidArgsFunction: cobra.NoFileCompletions,
+		Run: func(cmd *cobra.Command, args []string) {
+			clusterName := args[0]
+			doStuff(clusterName, *conf)
+		},
+	}
+	cmd.Flags().DurationVar(&conf.retryInterval, "retry-interval", 3*time.Second, "retry interval. Default 3s")
+	cmd.Flags().DurationVar(&conf.timeoutInterval, "timeout-interval", 10*time.Minute, "timeout interval. Default 10m")
+	cmd.Flags().StringVarP(&conf.namespace, "namespace", "n", "", "namespace of the cluster")
+	cmd.MarkFlagRequired("namespace")
+	return cmd
+}
+
+func doStuff(clusterName string, conf config) error {
+	// construct context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), conf.timeoutInterval)
+	defer cancel()
+
+	// interrupt handling
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
-	defer func() {
-		signal.Stop(c)
-		cancel()
-	}()
+	defer func() { signal.Stop(c) }()
 
 	// construct k8s dynamic client
 	client, err := constructClient()
@@ -75,15 +78,15 @@ func doStuff(clusterName, namespace string, timeout, retry time.Duration) error 
 	}
 
 	// prepare retries and timeouts
-	ticker := time.NewTicker(retry)
+	ticker := time.NewTicker(conf.retryInterval)
 	defer ticker.Stop()
-	timeoutC := time.After(timeout)
-	timeoutTime := time.Now().Add(timeout)
+	timeoutTime := time.Now().Add(conf.timeoutInterval)
 
+	// main polling loop
 	for {
-		status, err := getClusterStatus(ctx, client, clusterName, namespace)
+		status, err := getClusterStatus(ctx, client, clusterName, conf.namespace)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to fetch status of %s/%s: %s\n", namespace, clusterName, err.Error())
+			fmt.Fprintf(os.Stderr, "failed to fetch status of %s/%s: %s\n", conf.namespace, clusterName, err.Error())
 			os.Exit(1)
 		}
 		if status.ready == status.total {
@@ -92,21 +95,31 @@ func doStuff(clusterName, namespace string, timeout, retry time.Duration) error 
 		}
 		timeoutIn := timeoutTime.Sub(time.Now()).Truncate(time.Second)
 		fmt.Printf("ready %d out of %d, retry in %s, timeout in ~%s\n",
-			status.ready, status.total, retry, timeoutIn)
+			status.ready, status.total, conf.retryInterval, timeoutIn)
 
 		select {
 		case <-ticker.C:
 			continue
-		case <-timeoutC:
-			fmt.Fprintf(os.Stderr, "cluster %s is not ready. Exiting with timeout.\n", clusterName)
-			os.Exit(1)
 		case <-c:
 			cancel()
 			return nil
 		case <-ctx.Done():
+			fmt.Fprintf(os.Stderr, "cluster %s is not ready. Exiting with timeout.\n", clusterName)
+			os.Exit(1)
 		}
 	}
 
+}
+
+func objectHandler(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandlerFuncs {
+	return &cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			rcvCh <- obj.(*unstructured.Unstructured)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			rcvCh <- newObj.(*unstructured.Unstructured)
+		},
+	}
 }
 
 func getClusterStatus(ctx context.Context, client dynamic.Interface, name, namespace string) (solrStatus, error) {
