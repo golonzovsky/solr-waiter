@@ -11,11 +11,14 @@ import (
 	"github.com/spf13/cobra"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/watch"
 	"k8s.io/client-go/util/homedir"
 )
 
@@ -29,8 +32,8 @@ type solrStatus struct {
 }
 
 type config struct {
-	retryInterval   time.Duration
 	timeoutInterval time.Duration
+	initialDelay    time.Duration
 	namespace       string
 }
 
@@ -53,8 +56,8 @@ func NewRootCmd() *cobra.Command {
 			doStuff(clusterName, *conf)
 		},
 	}
-	cmd.Flags().DurationVar(&conf.retryInterval, "retry-interval", 3*time.Second, "retry interval. Default 3s")
-	cmd.Flags().DurationVar(&conf.timeoutInterval, "timeout-interval", 10*time.Minute, "timeout interval. Default 10m")
+	cmd.Flags().DurationVar(&conf.timeoutInterval, "timeout-interval", 10*time.Minute, "timeout interval. Set 0 to disable timeout. Default 10m")
+	cmd.Flags().DurationVar(&conf.initialDelay, "initial-delay", 0*time.Second, "initial delay. Default 0s")
 	cmd.Flags().StringVarP(&conf.namespace, "namespace", "n", "", "namespace of the cluster")
 	cmd.MarkFlagRequired("namespace")
 	return cmd
@@ -62,7 +65,7 @@ func NewRootCmd() *cobra.Command {
 
 func doStuff(clusterName string, conf config) error {
 	// construct context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), conf.timeoutInterval)
+	ctx, cancel := watch.ContextWithOptionalTimeout(context.Background(), conf.timeoutInterval)
 	defer cancel()
 
 	// interrupt handling
@@ -77,29 +80,39 @@ func doStuff(clusterName string, conf config) error {
 		os.Exit(1)
 	}
 
-	// prepare retries and timeouts
-	ticker := time.NewTicker(conf.retryInterval)
+	// construct watcher
+	informerReceiveObjectCh := make(chan *unstructured.Unstructured, 1)
+	tweakListOpts := func(options *v1.ListOptions) {
+		options.FieldSelector = fields.OneTermEqualSelector("metadata.name", clusterName).String()
+	}
+	target := dynamicinformer.NewFilteredDynamicSharedInformerFactory(client, 0, conf.namespace, tweakListOpts)
+	target.ForResource(solrResource).Informer().AddEventHandler(resendEventToCh(informerReceiveObjectCh))
+	target.Start(ctx.Done())
+	if synced := target.WaitForCacheSync(ctx.Done()); !synced[solrResource] {
+		return fmt.Errorf("informer for %s hasn't synced", solrResource)
+	}
+
+	// this is just for progress display, not used for polling
+	startTime := time.Now()
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-	timeoutTime := time.Now().Add(conf.timeoutInterval)
 
-	// main polling loop
+	// main listener loop
 	for {
-		status, err := getClusterStatus(ctx, client, clusterName, conf.namespace)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to fetch status of %s/%s: %s\n", conf.namespace, clusterName, err.Error())
-			os.Exit(1)
-		}
-		if status.ready == status.total {
-			fmt.Printf("cluster %s is ready. Exiting.", clusterName)
-			return nil
-		}
-		timeoutIn := timeoutTime.Sub(time.Now()).Truncate(time.Second)
-		fmt.Printf("ready %d out of %d, retry in %s, timeout in ~%s\n",
-			status.ready, status.total, conf.retryInterval, timeoutIn)
-
 		select {
 		case <-ticker.C:
-			continue
+			printStatus(startTime, conf.timeoutInterval)
+		case cluster := <-informerReceiveObjectCh:
+			status, err := getClusterStatus(cluster)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to fetch status of %s/%s: %s\n", conf.namespace, clusterName, err.Error())
+				os.Exit(1)
+			}
+			if status.ready == status.total {
+				printStatusMsg("cluster "+clusterName+" is ready. Exiting.", startTime)
+				return nil
+			}
+			printStatusMsg(fmt.Sprintf("ready %d out of %d", status.ready, status.total), startTime)
 		case <-c:
 			cancel()
 			return nil
@@ -111,7 +124,23 @@ func doStuff(clusterName string, conf config) error {
 
 }
 
-func objectHandler(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandlerFuncs {
+func printStatus(startTime time.Time, timeout time.Duration) {
+	timeoutIn := timeout - calculateElapsed(startTime)
+	if timeoutIn < 0 {
+		printStatusMsg("still watching cluster", startTime)
+	}
+	printStatusMsg(fmt.Sprintf("still watching cluster (timeout in ~%s)", timeoutIn), startTime)
+}
+
+func printStatusMsg(msg string, startTime time.Time) {
+	fmt.Printf("elapsed %s, %s\n", calculateElapsed(startTime), msg)
+}
+
+func calculateElapsed(startTime time.Time) time.Duration {
+	return time.Now().Sub(startTime).Truncate(time.Second)
+}
+
+func resendEventToCh(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandlerFuncs {
 	return &cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			rcvCh <- obj.(*unstructured.Unstructured)
@@ -122,22 +151,15 @@ func objectHandler(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEvent
 	}
 }
 
-func getClusterStatus(ctx context.Context, client dynamic.Interface, name, namespace string) (solrStatus, error) {
-	res, err := client.Resource(solrResource).Namespace(namespace).Get(ctx, name, v1.GetOptions{})
+func getClusterStatus(obj *unstructured.Unstructured) (solrStatus, error) {
+	ready, err := getStatusIntField(obj, "readyReplicas")
 	if err != nil {
 		return solrStatus{}, err
 	}
-
-	ready, err := getStatusIntField(res, "readyReplicas")
+	replicas, err := getStatusIntField(obj, "replicas")
 	if err != nil {
 		return solrStatus{}, err
 	}
-
-	replicas, err := getStatusIntField(res, "replicas")
-	if err != nil {
-		return solrStatus{}, err
-	}
-
 	return solrStatus{ready: ready, total: replicas}, nil
 }
 
@@ -153,7 +175,7 @@ func getStatusIntField(res *unstructured.Unstructured, fieldName string) (int64,
 }
 
 func constructClient() (dynamic.Interface, error) {
-	config, err := loadConfig()
+	config, err := loadK8sConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -164,11 +186,11 @@ func constructClient() (dynamic.Interface, error) {
 	return client, nil
 }
 
-func loadConfig() (*rest.Config, error) {
+func loadK8sConfig() (*rest.Config, error) {
 	kubeconfLocation := filepath.Join(homedir.HomeDir(), ".kube", "config")
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfLocation)
-	if err != nil {
-		return rest.InClusterConfig()
+	if err == nil {
+		return config, nil
 	}
-	return config, nil
+	return rest.InClusterConfig()
 }
