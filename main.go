@@ -23,12 +23,21 @@ import (
 )
 
 var (
-	solrResource = schema.GroupVersionResource{Group: "solr.apache.org", Version: "v1beta1", Resource: "solrclouds"}
+	solrResource = schema.GroupVersionResource{
+		Group:    "solr.apache.org",
+		Version:  "v1beta1",
+		Resource: "solrclouds",
+	}
 )
 
 type solrStatus struct {
-	ready int64
-	total int64
+	ready         int64
+	total         int64
+	upToDateNodes int64
+}
+
+func (s *solrStatus) isReady() bool {
+	return s.ready == s.total && s.total == s.upToDateNodes
 }
 
 type config struct {
@@ -84,10 +93,18 @@ func NewRootCmd() *cobra.Command {
 }
 
 func doStuff(ctx context.Context, clusterName string, conf config) error {
+	// construct k8s dynamic client here to fail fast on wrong config
+	client, err := constructClient()
+	if err != nil {
+		return fmt.Errorf("unable to build k8s client: %s", err.Error())
+	}
+
+	// wait for initial delay
 	if conf.initialDelay > 0 {
 		fmt.Printf("waiting for %s before watch start\n", conf.initialDelay)
 		waitCtx, cancel := watch.ContextWithOptionalTimeout(context.Background(), conf.initialDelay)
 		defer cancel()
+		// block wait here for initial delay or context cancel
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("initial wait interrupted")
@@ -99,12 +116,6 @@ func doStuff(ctx context.Context, clusterName string, conf config) error {
 	// construct context with timeout
 	ctx, cancel := watch.ContextWithOptionalTimeout(ctx, conf.timeoutInterval)
 	defer cancel()
-
-	// construct k8s dynamic client
-	client, err := constructClient()
-	if err != nil {
-		return fmt.Errorf("unable to build k8s client: %s", err.Error())
-	}
 
 	// validate cluster exists
 	_, err = client.Resource(solrResource).Namespace(conf.namespace).Get(ctx, clusterName, v1.GetOptions{})
@@ -118,7 +129,7 @@ func doStuff(ctx context.Context, clusterName string, conf config) error {
 		options.FieldSelector = fields.OneTermEqualSelector("metadata.name", clusterName).String()
 	}
 	target := dynamicinformer.NewFilteredDynamicSharedInformerFactory(client, 0, conf.namespace, tweakListOpts)
-	target.ForResource(solrResource).Informer().AddEventHandler(resendEventToCh(informerReceiveObjectCh))
+	target.ForResource(solrResource).Informer().AddEventHandler(republishToCh(informerReceiveObjectCh))
 	target.Start(ctx.Done())
 	if synced := target.WaitForCacheSync(ctx.Done()); !synced[solrResource] {
 		return fmt.Errorf("informer for %s hasn't synced", solrResource)
@@ -139,11 +150,11 @@ func doStuff(ctx context.Context, clusterName string, conf config) error {
 			if err != nil {
 				return fmt.Errorf("failed to fetch status of %s/%s: %s\n", conf.namespace, clusterName, err.Error())
 			}
-			if status.ready == status.total {
+			if status.isReady() {
 				printStatusMsg("cluster "+clusterName+" is ready. Exiting.", startTime)
 				return nil
 			}
-			printStatusMsg(fmt.Sprintf("ready %d out of %d", status.ready, status.total), startTime)
+			printStatusMsg(fmt.Sprintf("ready %d, total %d, upToDateNodes %d", status.ready, status.total, status.upToDateNodes), startTime)
 		case <-ctx.Done():
 			return fmt.Errorf("cluster %s is not ready. Exiting with timeout/interrupt", clusterName)
 		}
@@ -167,7 +178,7 @@ func calculateElapsed(startTime time.Time) time.Duration {
 	return time.Now().Sub(startTime).Truncate(time.Second)
 }
 
-func resendEventToCh(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandlerFuncs {
+func republishToCh(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandlerFuncs {
 	return &cache.ResourceEventHandlerFuncs{
 		// this is for "already ready" case
 		AddFunc: func(obj interface{}) {
@@ -188,7 +199,11 @@ func getClusterStatus(obj *unstructured.Unstructured) (solrStatus, error) {
 	if err != nil {
 		return solrStatus{}, err
 	}
-	return solrStatus{ready: ready, total: replicas}, nil
+	upToDate, err := getStatusIntField(obj, "upToDateNodes")
+	if err != nil {
+		return solrStatus{}, err
+	}
+	return solrStatus{ready: ready, total: replicas, upToDateNodes: upToDate}, nil
 }
 
 func getStatusIntField(res *unstructured.Unstructured, fieldName string) (int64, error) {
